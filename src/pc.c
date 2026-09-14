@@ -1110,15 +1110,16 @@ PC *pc_new(SimpleFBDrawFunc *redraw, void (*poll)(void *), void *redraw_data,
 			insertdisk(i, false, true, conf->ata[i]);
 		} else {
 			/* HDD: insertdisk opens the file, then attach */
-			insertdisk(i, false, false, conf->ata[i]);
-			FIL *fil = ata_get_file(i);
-			if (fil)
-				ide_attach_ata(i < 2 ? pc->ide : pc->ide2,
-				               i < 2 ? i : i - 2,
-				               fil,
-				               ata_get_cyls(i),
-				               ata_get_heads(i),
-				               ata_get_sects(i));
+			if (insertdisk(i, false, false, conf->ata[i])) {
+				FIL *fil = ata_get_file(i);
+				if (fil)
+					ide_attach_ata(i < 2 ? pc->ide : pc->ide2,
+					               i < 2 ? i : i - 2,
+					               fil,
+					               ata_get_cyls(i),
+					               ata_get_heads(i),
+					               ata_get_sects(i));
+			}
 		}
 	}
 

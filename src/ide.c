@@ -899,6 +899,7 @@ static void ide_sector_write(IDEState *s)
     s->xfer_is_write = 1;
     s->xfer_done     = ide_sector_write_flush;
     s->status        = READY_STAT | SEEK_STAT | DRQ_STAT;
+    ide_set_irq(s);
 }
 
 static void ide_identify_cb(IDEState *s)
