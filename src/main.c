@@ -662,6 +662,7 @@ static void load_default_config(void) {
     config.fdd[1] = NULL;
 
     config.redirector = 1;
+    config.fill_cmos = 1;
     config.enable_serial = 0;
     config.vga_force_8dm = 0;
 }

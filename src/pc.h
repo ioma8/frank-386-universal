@@ -20,6 +20,7 @@
 #include "ini.h"
 #include "sn76489.h"
 #include "fdd.h"
+#include "ne2000.h"
 
 /// Platform HAL
 uint32_t get_uticks();
@@ -57,6 +58,7 @@ typedef struct {
 	PS2KbdState *kbd;
 	PS2MouseState *mouse;
 	AdlibState *adlib;
+	NE2000State *ne2000;
 	I8257State *isa_dma, *isa_hdma;
 	FDCState   *fdc;
 
@@ -123,6 +125,7 @@ typedef struct {
 	int iscd[4];
 	const char *fdd[2];
 	int redirector;
+	int fill_cmos;
 	int width;
 	int height;
 	int cpu_gen;

@@ -279,13 +279,15 @@ static __always_inline u8 _pc_io_read(void *o, int addr)
 	case 0xcfc: case 0xcfd: case 0xcfe: case 0xcff:
 		val = i440fx_read_data(pc->i440fx, addr - 0xcfc, 0);
 		return val;
-	/* NE2000 networking removed */
 	case 0x300: case 0x301: case 0x302: case 0x303:
 	case 0x304: case 0x305: case 0x306: case 0x307:
 	case 0x308: case 0x309: case 0x30a: case 0x30b:
 	case 0x30c: case 0x30d: case 0x30e: case 0x30f:
-	case 0x310: case 0x31f:
-		return 0xff;
+		return ne2000_ioport_read(pc->ne2000, addr);
+	case 0x310:
+		return ne2000_asic_ioport_read(pc->ne2000, addr);
+	case 0x31f:
+		return ne2000_reset_ioport_read(pc->ne2000, addr);
 	case 0x00: case 0x01: case 0x02: case 0x03:
 	case 0x04: case 0x05: case 0x06: case 0x07:
 		val = i8257_read_chan(pc->isa_dma, addr - 0x00, 1);
@@ -398,9 +400,8 @@ static __always_inline u16 _pc_io_read16(void *o, int addr)
 	case 0xcfc: case 0xcfe:
 		val = i440fx_read_data(pc->i440fx, addr - 0xcfc, 1);
 		return val;
-	/* NE2000 networking removed */
 	case 0x310:
-		return 0xffff;
+		return ne2000_asic_ioport_read(pc->ne2000, addr);
 	case 0x220:
 		if (pc->adlib_enabled)
 			return adlib_read(pc->adlib, addr);
@@ -583,12 +584,17 @@ static void pc_io_write(void *o, int addr, u8 val)
 	case 0xcfc: case 0xcfd: case 0xcfe: case 0xcff:
 		i440fx_write_data(pc->i440fx, addr - 0xcfc, val, 0);
 		return;
-	/* NE2000 networking removed */
 	case 0x300: case 0x301: case 0x302: case 0x303:
 	case 0x304: case 0x305: case 0x306: case 0x307:
 	case 0x308: case 0x309: case 0x30a: case 0x30b:
 	case 0x30c: case 0x30d: case 0x30e: case 0x30f:
-	case 0x310: case 0x31f:
+		ne2000_ioport_write(pc->ne2000, addr, val);
+		return;
+	case 0x310:
+		ne2000_asic_ioport_write(pc->ne2000, addr, val);
+		return;
+	case 0x31f:
+		ne2000_reset_ioport_write(pc->ne2000, addr, val);
 		return;
 	case 0x00: case 0x01: case 0x02: case 0x03:
 	case 0x04: case 0x05: case 0x06: case 0x07:
@@ -717,8 +723,8 @@ static void pc_io_write16(void *o, int addr, u16 val)
 	case 0xcfc: case 0xcfe:
 		i440fx_write_data(pc->i440fx, addr - 0xcfc, val, 1);
 		return;
-	/* NE2000 networking removed */
 	case 0x310:
+		ne2000_asic_ioport_write(pc->ne2000, addr, val);
 		return;
 	default:
 ///		fprintf(stderr, "outw 0x%x => 0x%x\n", val, addr);
@@ -799,6 +805,7 @@ void __not_in_flash_func(pc_step)(PC *pc)
 	i8257_dma_run(pc->isa_dma);
 	i8257_dma_run(pc->isa_hdma);
 	if (pc->fdc) fdc_tick(pc->fdc);
+	if (pc->ne2000) ne2000_step(pc->ne2000);
 	PROF_ADD(t_dev, devices);
 #if !defined(BUILD_ESP32) && !defined(RP2350_BUILD)
 	pc->poll(pc->redraw_data);
@@ -1028,7 +1035,13 @@ PC *pc_new(SimpleFBDrawFunc *redraw, void (*poll)(void *), void *redraw_data,
 	f_open(&ports_log, "ports.log", FA_WRITE | FA_CREATE_ALWAYS);
 #endif
 	PC *pc = malloc(sizeof(PC));
-    char *mem = (uint8_t*)0x11000000;
+#if defined(FRANK_HOST)
+	/* Desktop: guest RAM is an ordinary allocation. On the RP2350 it is
+	 * the XIP-mapped PSRAM window at 0x11000000. */
+	char *mem = (uint8_t *)pcmalloc(conf->mem_size);
+#else
+	char *mem = (uint8_t*)0x11000000;
+#endif
 	CPU_CB *cb = NULL;
 	memset(mem, 0, conf->mem_size);
 #ifdef BUILD_ESP32
@@ -1116,7 +1129,8 @@ PC *pc_new(SimpleFBDrawFunc *redraw, void (*poll)(void *), void *redraw_data,
 
 
 
-	ide_fill_cmos(pc->ide, pc->cmos, cmos_set);
+	if (conf->fill_cmos)
+		ide_fill_cmos(pc->ide, pc->cmos, cmos_set);
 
 	/* we have emulation for 2 FDDs (CMOS 0x10):
 		биты 7-4 = тип A:
@@ -1150,13 +1164,14 @@ PC *pc_new(SimpleFBDrawFunc *redraw, void (*poll)(void *), void *redraw_data,
 
 	pc->boot_start_time = 0;
 
-	/* gfx_buffer is always 256 KB — always use exactly that, ignoring
-	 * whatever vga_mem the config says.  This ensures Wolf3D's three video
-	 * pages (dword offsets 0 / 16640 / 33280, up to byte 133120) are never
-	 * dropped.  Old SD-card configs with vga_mem=128K would otherwise leave
-	 * the third page zeroed (black) due to the size check in vga_mem_write. */
-	pc->vga_mem_size = 256u << 10;   /* fixed: gfx_buffer is always 256 KB */
+#if defined(FRANK_HOST)
+	pc->vga_mem_size = conf->vga_mem_size > 0 ? conf->vga_mem_size : 256u << 10;
+	pc->vga_mem = pcmalloc(pc->vga_mem_size);
+#else
+	/* The RP2350 scanout drivers use a fixed 256 KB live framebuffer. */
+	pc->vga_mem_size = 256u << 10;
 	pc->vga_mem = gfx_buffer;
+#endif
 	memset(pc->vga_mem, 0, pc->vga_mem_size);
 	pc->vga = vga_init(pc->vga_mem, pc->vga_mem_size,
 			   fb, conf->width, conf->height);
@@ -1192,7 +1207,7 @@ PC *pc_new(SimpleFBDrawFunc *redraw, void (*poll)(void *), void *redraw_data,
 			       pc, pc_reset_request);
 	i8042_set_cpu(pc->cpu);
 	pc->adlib = adlib_new();
-	/* NE2000 networking removed */
+	pc->ne2000 = isa_ne2000_init(0x300, 9, pc->pic, set_irq);
 	pc->isa_dma = i8257_new(pc->phys_mem, pc->phys_mem_size,
 				0x00, 0x80, 0x480, 0);
 	pc->isa_hdma = i8257_new(pc->phys_mem, pc->phys_mem_size,
@@ -1331,6 +1346,8 @@ int parse_conf_ini(void* user, const char* section,
 			conf->fdd[1] = strdup(value);
 		} else if (NAME("redirector")) {
 			conf->redirector = atoi(value);
+		} else if (NAME("fill_cmos")) {
+			conf->fill_cmos = atoi(value);
 		} else if (NAME("linuxstart")) {
 			conf->linuxstart = strdup(value);
 		} else if (NAME("kernel")) {

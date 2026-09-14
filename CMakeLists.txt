@@ -246,6 +246,7 @@ set(EMU_CORE_SOURCES
     src/i386.c
     src/i386_arm.S   # ARM assembly optimizations for hot paths
     src/pc.c
+    src/ne2000.c
 
     # Peripheral chips
     src/i8042.c      # Keyboard controller
@@ -274,7 +275,6 @@ set(EMU_CORE_SOURCES
 
     # Optional devices (can be disabled for size)
     src/fpu.c      # FPU emulation - disabled for initial port
-    # src/ne2000.c   # Network - disabled for initial port
 
     # Configuration
     src/ini.c
@@ -357,10 +357,14 @@ target_compile_definitions(${BUILD_NAME} PRIVATE
     # Disable features for initial port
 #    NO_FPU=1
     # NO_SOUND=1  # Sound enabled with I2S output
-    NO_NETWORK=1
 
     # Performance optimizations
     I386_ENABLE_INLINE=1
+    I386_ENABLE_MMX=1
+    I386_ENABLE_SSE=1
+    I386_ENABLE_SSE2=1
+    I386_ENABLE_SSE3=1
+    I386_ENABLE_SSSE3=1
 
     SOUND_FREQUENCY=44100
 

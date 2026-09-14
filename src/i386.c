@@ -3819,7 +3819,9 @@ static bool verrw_helper(CPUI386 *cpu, int sel, int wr, int *zf)
 // 586 and later...
 #define UD0() THROW0(EX_UD);
 
-#if defined(I386_ENABLE_SSE3)
+#if defined(I386_ENABLE_SSSE3)
+#define CPUID_SIMD_FEATURE2 0x201
+#elif defined(I386_ENABLE_SSE3)
 #define CPUID_SIMD_FEATURE2 0x1
 #else
 #define CPUID_SIMD_FEATURE2 0x0

@@ -1,7 +1,11 @@
 // incomplete x87 emulation, use at your own risk!
 // no exception, no tag word, no float80
-#include "fpu.h"
+#if defined(USE_AMD64)
+#include "amd64.h"
+#else
 #include "i386.h"
+#endif
+#include "fpu.h"
 #include <string.h>
 #include <stdlib.h>
 #include <assert.h>
@@ -125,6 +129,20 @@ static long double fromf80(F80 f80)
 #define sincos sincosl
 #endif
 
+typedef union {
+	uint32_t u32v[4];
+	uint64_t u64v[2];
+	float f32v[4];
+	double f64v[2];
+
+	uint16_t u16v[8];
+	uint8_t u8v[16];
+	int64_t s64v[2];
+	int32_t s32v[4];
+	int16_t s16v[8];
+	int8_t s8v[16];
+} UXMM;
+
 struct FPU {
 	u16 cw, sw; // TODO: tag word
 	unsigned int top;
@@ -133,6 +151,15 @@ struct FPU {
 	F80 rawst[8];
 	u8 rawtagr;
 	u8 rawtagw;
+
+#ifdef I386_ENABLE_SSE
+	u32 mxcsr;
+#ifndef USE_AMD64
+	UXMM xmm[8];
+#else
+	UXMM xmm[16];
+#endif
+#endif
 };
 
 static u16 getsw(FPU *fpu)
@@ -277,17 +304,21 @@ static bool fploadbcd(void *cpu, int seg, uword addr, double *res)
 	uint64_t val = 0;
 	int sign = hi & 0x8000;
 	hi &= 0x7FFF;
+	uint64_t base = 1;
 	for (int i = 0; i < 4; i++) {
-		val = val * 100 + bcd100(lo);
+		val += base * bcd100(lo);
 		lo >>= 8;
+		base *= 100;
 	}
 	for (int i = 0; i < 4; i++) {
-		val = val * 100 + bcd100(mi);
+		val += base * bcd100(mi);
 		mi >>= 8;
+		base *= 100;
 	}
 	for (int i = 0; i < 2; i++) {
-		val = val * 100 + bcd100(hi);
+		val += base * bcd100(hi);
 		hi >>= 8;
+		base *= 100;
 	}
 	*res = copysign(val, sign ? -1.0 : 1.0);
 	return true;
@@ -329,6 +360,8 @@ static double fpround(double x, int rc)
 {
 	switch (rc) {
 	case 0:
+		// XXX: we assume `fegetround() == 1` here.
+		// In C23, we can use `roundeven()` instead.
 		return nearbyint(x);
 	case 1:
 		return floor(x);
@@ -445,7 +478,7 @@ static void fparith(FPU *fpu, int group, unsigned int d, double a, double b)
 	}
 }
 
-bool fpu_exec2(FPU *fpu, void *cpu, bool opsz16, int op, int group, int seg, uint32_t addr)
+bool fpu_exec2(FPU *fpu, void *cpu, bool opsz16, int op, int group, int seg, uword addr)
 {
 	double a;
 	switch (op) {
@@ -799,7 +832,10 @@ bool fpu_exec2(FPU *fpu, void *cpu, bool opsz16, int op, int group, int seg, uin
 enum {
 	CF = 0x1,
 	PF = 0x4,
+	AF = 0x10,
 	ZF = 0x40,
+	SF = 0x80,
+	OF = 0x800,
 };
 
 static bool cmov_cond(FPU *fpu, void *cpu, int i)
@@ -1205,8 +1241,8 @@ bool fpu_exec1(FPU *fpu, void *cpu, int op, int group, unsigned int i)
 	return true;
 }
 
-#ifdef I386_ENABLE_MMX
-#define MMX_fpu_c
+#if defined(I386_ENABLE_MMX) || defined(I386_ENABLE_SSE)
+#define SIMD_fpu_c
 #include "simd.inc"
-#undef MMX_fpu_c
+#undef SIMD_fpu_c
 #endif
