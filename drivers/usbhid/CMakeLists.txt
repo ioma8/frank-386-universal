@@ -27,6 +27,27 @@ if(USB_HID_ENABLED)
         USB_HID_ENABLED=1
     )
 
+    if(PIO_USB_ENABLED)
+        message(STATUS "  USB host on PIO-USB (root port 1)")
+        # SRAM is tight (the heap feeds pc_new()). The stock pool is sized
+        # for 2 root ports and 32 endpoints, ~6 KB. One root port, and 24
+        # endpoints: a hub, a composite keyboard (up to ~5 HID interfaces)
+        # and a mouse, each with its control endpoint, plus address 0.
+        target_compile_definitions(usbhid INTERFACE
+            CFG_TUH_RPI_PIO_USB=1
+            PIO_USB_ROOT_PORT_CNT=1
+            PIO_USB_EP_POOL_CNT=24
+        )
+        target_link_libraries(usbhid INTERFACE tinyusb_pico_pio_usb)
+        # The native port is free: the USB CDC console runs there, a TinyUSB
+        # device next to the PIO-USB host (pico_stdio_usb cannot: it compiles
+        # to nothing once the host library is linked).
+        message(STATUS "  USB CDC console on the native USB port")
+        target_sources(usbhid INTERFACE ${CMAKE_CURRENT_LIST_DIR}/usb_console.c)
+        target_compile_definitions(usbhid INTERFACE USB_CDC_CONSOLE=1)
+        target_link_libraries(usbhid INTERFACE tinyusb_device pico_unique_id)
+    endif()
+
     # Link TinyUSB Host
     target_link_libraries(usbhid INTERFACE
         tinyusb_host

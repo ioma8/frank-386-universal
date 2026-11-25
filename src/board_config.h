@@ -61,6 +61,15 @@
 #ifndef BOARD_C2
 #define BOARD_HAS_PS2 1
 #endif
+/*
+ * Z2 (RP2350-PiZero) has its PS/2 mouse on GPIO0/1, which a USB HID
+ * build hands to the UART console instead (USB is in host mode, so it
+ * is the only console). The keyboard and mouse are USB there anyway.
+ * From PR #9 by @blee-blee.
+ */
+#if defined(BOARD_Z2) && defined(USB_HID_ENABLED)
+#undef BOARD_HAS_PS2
+#endif
 
 //=============================================================================
 // CPU/PSRAM Speed Defaults (can be overridden via CMake)
@@ -96,8 +105,15 @@
 #endif
 #endif
 
-// PSRAM pin for RP2350B (always GPIO47)
+// PSRAM pin for RP2350B variants. GPIO47 everywhere except the PC layout:
+// the Olimex RP2350pc (RP2350B, same pinout as the PICO-PC carrier) has
+// its PSRAM on GPIO8 like a Pico 2 in the carrier does, and GPIO47 found
+// nothing, so the PSRAM test failed before video came up (issue #10).
+#ifdef BOARD_PC
+#define PSRAM_PIN_RP2350B 8
+#else
 #define PSRAM_PIN_RP2350B 47
+#endif
 
 // PSRAM memory size (8MB)
 #if EMULATE_LTEMS
@@ -112,14 +128,33 @@
 #define PSRAM_BASE_ADDR  PSRAM_BASE
 
 // Runtime function to get PSRAM pin based on chip package
+// Set by main.c when the PSRAM was found on another pin than the default
+extern int psram_cs_override;
+
+/*
+ * PC layout only: true on the Olimex RP2350pc. The PICO-PC carrier takes a
+ * Pico 2, which is an RP2350A, and the RP2350pc is an RP2350B, so the
+ * package tells the two apart. The RP2350pc has no PS/2 port, its GPIO9 is
+ * the SD chip select (the NES pad latch on the carrier) and its audio is a
+ * codec on unknown pins, so PS/2, the NES pad and PWM audio stay off there.
+ */
+static inline bool board_is_rp2350pc(void) {
+#ifdef BOARD_PC
+    return !(*((io_ro_32*)(SYSINFO_BASE + SYSINFO_PACKAGE_SEL_OFFSET)) & 1);
+#else
+    return false;
+#endif
+}
+
 static inline uint get_psram_pin(void) {
+    if (psram_cs_override >= 0) return (uint)psram_cs_override;
     // Check if RP2350A (bit 0 set) or RP2350B (bit 0 clear)
     uint32_t package_sel = *((io_ro_32*)(SYSINFO_BASE + SYSINFO_PACKAGE_SEL_OFFSET));
     if (package_sel & 1) {
         // RP2350A - use board-specific pin
         return PSRAM_PIN_RP2350A;
     } else {
-        // RP2350B - always GPIO47
+        // RP2350B - GPIO47, GPIO8 on the PC layout
         return PSRAM_PIN_RP2350B;
     }
 }
@@ -256,11 +291,17 @@ static inline uint get_psram_pin(void) {
 
 #define HDMI_BASE_PIN HDMI_PIN_CLKN
 
-// SD Card Pins
-#define SDCARD_PIN_CLK    6
-#define SDCARD_PIN_CMD    7
-#define SDCARD_PIN_D0     4
-#define SDCARD_PIN_D3     22
+/*
+ * SD card. The PC layout serves two boards, told apart at runtime by
+ * board_is_rp2350pc(): the PICO-PC carrier with a Pico 2 (RP2350A) and
+ * the Olimex RP2350pc (RP2350B), which has its card on the SPI1 pins
+ * 10/11/24/9 (#10). The PC build drives the card through PIO SPI, which
+ * takes any pins, so a runtime choice costs nothing.
+ */
+#define SDCARD_PIN_CLK    (board_is_rp2350pc() ? 10 : 6)
+#define SDCARD_PIN_CMD    (board_is_rp2350pc() ? 11 : 7)
+#define SDCARD_PIN_D0     (board_is_rp2350pc() ? 24 : 4)
+#define SDCARD_PIN_D3     (board_is_rp2350pc() ? 9 : 22)
 
 #define SDCARD_PIN_SPI0_SCK   SDCARD_PIN_CLK
 #define SDCARD_PIN_SPI0_MOSI  SDCARD_PIN_CMD
@@ -331,6 +372,12 @@ static inline uint get_psram_pin(void) {
 // PS/2 Mouse Pins (if available)
 #define PS2_MOUSE_CLK  0
 #define PS2_MOUSE_DATA 1
+
+// "PIO-USB" USB-C socket (D- is D+ + 1). Driven from pio1, which is free
+// here: video is on pio0, I2S and the NES pad on pio2, and PS/2 (pio1
+// otherwise) is compiled out in the USB HID builds that use this port.
+#define PIO_USB_DP_PIN 28
+#define PIO_USB_PIO    1
 
 // I2S Audio Pins
 #define I2S_DATA_PIN       10
@@ -539,6 +586,12 @@ static inline uint get_psram_pin(void) {
 #define CONFIG_CPU_DIR      "/.config/386"
 #define CONFIG_PLATFORM_DIR CONFIG_CPU_DIR "/" CONFIG_PLATFORM_NAME
 #define CONFIG_FILE_PATH    CONFIG_PLATFORM_DIR "/config.ini"
+/* Where config.ini lived before the per-platform directory. Still read
+ * when CONFIG_FILE_PATH does not exist, so cards set up for v1.05 and
+ * earlier keep booting; the first save from the settings UI writes the
+ * full config to CONFIG_FILE_PATH, which takes over from then on. */
+#define CONFIG_LEGACY_DIR   "386"
+#define CONFIG_LEGACY_PATH  CONFIG_LEGACY_DIR "/config.ini"
 #define VIDEO_MARKER_VGA    CONFIG_PLATFORM_DIR "/force_vga"
 #define VIDEO_MARKER_HDMI   CONFIG_PLATFORM_DIR "/force_dvi"
 #define AUDIO_MARKER_PWM    CONFIG_PLATFORM_DIR "/force_pwm"

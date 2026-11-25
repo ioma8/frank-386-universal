@@ -25,6 +25,7 @@
 #include "audio.h"
 #include "dss.h"
 #include "adlib.h"
+#include "hdmi.h"
 #include "board_config.h"
 #include <pico/time.h>
 
@@ -249,8 +250,12 @@ void audio_init(void) {
 #endif
 #if HAS_AUDIO_PWM
     pwm = pwm_get_default_config();
-    gpio_set_function(PWM_LEFT_PIN, GPIO_FUNC_PWM);
-    gpio_set_function(PWM_RIGHT_PIN, GPIO_FUNC_PWM);
+    // The Olimex RP2350pc has an audio codec instead; its pins are not
+    // mapped yet, so leave GPIO27/28 alone there (silent, not driven)
+    if (!board_is_rp2350pc()) {
+        gpio_set_function(PWM_LEFT_PIN, GPIO_FUNC_PWM);
+        gpio_set_function(PWM_RIGHT_PIN, GPIO_FUNC_PWM);
+    }
 #ifdef BEEPER_PIN
     gpio_set_function(BEEPER_PIN, GPIO_FUNC_PWM);
 #endif
@@ -326,6 +331,16 @@ bool __not_in_flash_func(timer_callback)(repeating_timer_t *rt) {
     }
     r_v += dss_v;
     l_v += dss_v;
+    {
+        /* HDMI audio (a no-op on VGA): the I2S mix, after the volume */
+        int hr = r_v, hl = l_v;
+        if (b_v) { hr = hl = 32767; }
+        if (hr > 32767) hr = 32767;
+        if (hr < -32768) hr = -32768;
+        if (hl > 32767) hl = 32767;
+        if (hl < -32768) hl = -32768;
+        hdmi_audio_push((int16_t)(hl >> volume), (int16_t)(hr >> volume));
+    }
 #if HAS_AUDIO_I2S
     if (audio_use_i2s) {
         if (b_v) { r_v = l_v = 32767; }
