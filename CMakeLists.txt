@@ -15,7 +15,7 @@ endif()
 cmake_minimum_required(VERSION 3.13)
 
 # Board configuration variant (M1, M2, PC, Z2 or C2)
-set(BOARD "Z2" CACHE STRING "Board variant: M1, M2, PC, Z2 or C2")
+set(BOARD "M2" CACHE STRING "Board variant: M1, M2, PC, Z2 or C2")
 # Alias for backwards compatibility
 if(DEFINED BOARD_VARIANT AND NOT DEFINED BOARD)
     set(BOARD ${BOARD_VARIANT})
@@ -66,6 +66,11 @@ option(EMM "Enable LTEMM support" OFF)
 # USB HID keyboard support (disabled by default to keep USB CDC for debug)
 option(USB_HID_ENABLED "Enable USB HID keyboard (disables USB CDC stdio)" ON)
 
+# Z2 (RP2350-PiZero) USB host port: the board's "PIO-USB" USB-C socket
+# (GPIO28/29, driven by Pico-PIO-USB) instead of the native "USB" one.
+# TinyUSB runs one host controller, so it is one or the other.
+option(Z2_PIO_USB "Z2: USB host on the PIO-USB port (OFF = native USB port)" ON)
+
 # Force HDMI output (skip VGA/HDMI pin auto-detection)
 option(FORCE_HDMI "Force HDMI output instead of VGA" OFF)
 
@@ -104,6 +109,16 @@ else()
 endif()
 
 message(STATUS "frank-386: Board=${BOARD}, CPU=${CPU_SPEED}MHz, PSRAM=${PSRAM_SPEED}MHz, Voltage=${CPU_VOLTAGE}, Audio=runtime")
+
+if(BOARD STREQUAL "Z2" AND USB_HID_ENABLED AND Z2_PIO_USB)
+    set(PIO_USB_ENABLED ON)
+    # Vendored Pico-PIO-USB 0.7.2 (sekigon-gonnoc, MIT). Must be set before
+    # pico_sdk_init(): TinyUSB's rp2040 family script picks it up from here
+    # and creates the tinyusb_pico_pio_usb target.
+    set(PICO_PIO_USB_PATH ${CMAKE_CURRENT_LIST_DIR}/drivers/pio_usb)
+else()
+    set(PIO_USB_ENABLED OFF)
+endif()
 
 include(pico_sdk_import.cmake)
 
@@ -201,6 +216,7 @@ target_link_libraries(psram pico_stdlib hardware_clocks)
 #=============================================================================
 add_library(video_driver
     drivers/hdmi/hdmi.c
+    drivers/hdmi/hstx_packet.c
     drivers/vga/test_pins.c
     drivers/vga/vga_hw.c
     drivers/vga/vga_osd.c
@@ -212,6 +228,8 @@ target_compile_definitions(video_driver PRIVATE
     RP2350_BUILD=1
 )
 target_link_libraries(video_driver pico_stdlib hardware_dma hardware_pio hardware_clocks hardware_sync)
+# the HDMI line IRQ must stay in SRAM: no loops turned into newlib calls
+set_source_files_properties(drivers/hdmi/hdmi.c PROPERTIES COMPILE_OPTIONS "-fno-tree-loop-distribute-patterns")
 
 #=============================================================================
 # Runtime I2S/PWM Audio Driver
@@ -513,6 +531,11 @@ if(USB_HID_ENABLED)
         # and bring-up on a board whose slave cannot be reset by the
         # master is not something to attempt blind.
         message(STATUS "USB HID enabled: console on UART0 (J2, GPIO0/1)")
+        pico_enable_stdio_uart(${BUILD_NAME} 1)
+    elseif(BOARD STREQUAL "Z2")
+        # Z2's GPIO0/1 carry the PS/2 mouse, which board_config.h drops
+        # in a USB HID build, so the UART console can have them.
+        message(STATUS "USB HID enabled: console on UART0 (GPIO0/1)")
         pico_enable_stdio_uart(${BUILD_NAME} 1)
     else()
         # Other boards route GPIO0/1 to PS/2 or a gamepad, so there is no

@@ -28,6 +28,12 @@
 
 #include "board_config.h"
 #include "psram_init.h"
+#if USB_CDC_CONSOLE
+#include "usb_console.h"
+#endif
+#include "hdmi.h"
+#include "pico/bootrom.h"
+#include "hardware/structs/psm.h"
 #include "vga_hw.h"
 #include "vga.h"
 #include "ps2.h"
@@ -78,6 +84,7 @@
 //=============================================================================
 
 PC *pc = NULL;
+int psram_cs_override = -1;  // see get_psram_pin()
 static PCConfig config;
 volatile bool initialized = false;
 
@@ -290,11 +297,20 @@ void *pcmalloc(long size) {
  * Load ROM file from SD card to memory.
  */
 int load_rom(void *phys_mem, const char *file, uword addr, int backward) {
-    FIL fp;
+    /*
+     * Static, not on the stack: a FIL carries a 512-byte sector buffer,
+     * and core 0's stack (top of SCRATCH_Y, 4 KB shared with the data
+     * placed there) is only a few hundred bytes deeper than this boot
+     * path. On the stack, main -> init_emulator -> pc_new -> load_rom ->
+     * FatFS/printf ran into spread8_lut and corrupted EGA/VGA 640-wide
+     * output (PR #9). The same goes for the other boot-time file
+     * helpers in this file. Core 0 only, never reentered.
+     */
+    static FIL fp;
     FRESULT res;
     UINT bytes_read;
 
-    char path[256];
+    static char path[256];
     snprintf(path, sizeof(path), "386/%s", file);
 
     res = f_open(&fp, path, FA_READ);
@@ -668,10 +684,11 @@ static void load_default_config(void) {
 }
 
 static int load_config_from_sd(const char *filename) {
-    FIL fp;
+    // Static to keep the boot path's stack shallow, see load_rom()
+    static FIL fp;
     FRESULT res;
-    DIR dir;
-    FILINFO fno;
+    static DIR dir;
+    static FILINFO fno;
 
     // Debug: List 386 directory contents
     DBG_PRINT("Checking SD card contents...\n");
@@ -698,10 +715,15 @@ static int load_config_from_sd(const char *filename) {
         }
     }
 
-    char path[256];
+    static char path[256];
     snprintf(path, sizeof(path), CONFIG_PLATFORM_DIR "/%s", filename);
 
     res = f_open(&fp, path, FA_READ);
+    if (res != FR_OK) {
+        DBG_PRINT("Config file not found: %s (error %d)\n", path, res);
+        snprintf(path, sizeof(path), CONFIG_LEGACY_DIR "/%s", filename);
+        res = f_open(&fp, path, FA_READ);
+    }
     if (res != FR_OK) {
         DBG_PRINT("Config file not found: %s (error %d)\n", path, res);
         return -1;
@@ -765,6 +787,84 @@ void console_reclock(void) {
 #ifdef LIB_PICO_STDIO_UART
     uart_set_baudrate(uart_default, PICO_DEFAULT_UART_BAUD_RATE);
 #endif
+}
+
+/*
+ * Make sure the flash chip has its Quad Enable bit set.
+ *
+ * Winbond parts ship with QE=1. Some boards — Waveshare RP2350-PiZero
+ * batches with Puya flash among them — ship with QE=0, which leaves the
+ * flash's IO2/IO3 as WP#/HOLD# rather than data lines. With PSRAM on the
+ * same QSPI bus such a board locks up or fails the PSRAM test as soon as
+ * it is overclocked (issue #6). The standalone FLASH_QE_SET_1.uf2
+ * fixes it once; doing the same here means nobody has to know about it.
+ *
+ * QE is non-volatile, so this writes the status register at most once
+ * in the chip's life: every later boot reads QE=1 and returns. Only
+ * vendors whose QE is bit 1 of SR2, read with 0x35 and written with
+ * 0x31, are touched — on e.g. Macronix 0x35 means "enter QPI" instead.
+ *
+ * The flash is unreadable while it rewrites a status register, so the
+ * whole sequence — including the busy poll — runs from RAM with
+ * interrupts off. Must run before core 1 is launched.
+ *
+ * Returns -1 if the vendor is not handled, 0 if QE was already set,
+ * 1 if it was set now, and -2 if the write did not take.
+ */
+static int __no_inline_not_in_flash_func(flash_ensure_qe)(uint8_t *jedec_mfr) {
+    uint8_t tx[4], rx[4];
+
+    tx[0] = 0x9F; tx[1] = 0; tx[2] = 0; tx[3] = 0;
+    flash_do_cmd(tx, rx, 4);
+    *jedec_mfr = rx[1];
+    switch (rx[1]) {
+    case 0xEF:  // Winbond
+    case 0xC8:  // GigaDevice
+    case 0x85:  // Puya
+    case 0x68:  // Boya
+    case 0x5E:  // Zbit
+        break;
+    case 0x20:  // XMC, but Micron uses 20h too and has no SR2 QE bit
+        if (rx[2] != 0x40 && rx[2] != 0x70) return -1;  // XM25QH memory types
+        break;
+    default:
+        return -1;
+    }
+
+    tx[0] = 0x35; tx[1] = 0;
+    flash_do_cmd(tx, rx, 2);
+    const uint8_t sr2 = rx[1];
+    if (sr2 & 0x02) return 0;
+
+    tx[0] = 0x06;                       // Write Enable
+    flash_do_cmd(tx, rx, 1);
+    tx[0] = 0x31; tx[1] = sr2 | 0x02;   // Write SR2, keep the other bits
+    flash_do_cmd(tx, rx, 2);
+
+    // Poll WIP. tW is 15 ms worst case; each poll is tens of us.
+    for (int i = 0; i < 100000; i++) {
+        tx[0] = 0x05; tx[1] = 0;
+        flash_do_cmd(tx, rx, 2);
+        if (!(rx[1] & 0x01)) break;
+    }
+
+    tx[0] = 0x35; tx[1] = 0;
+    flash_do_cmd(tx, rx, 2);
+    return (rx[1] & 0x02) ? 1 : -2;
+}
+
+static void flash_qe_fixup(void) {
+    uint8_t mfr;
+    uint32_t irq = save_and_disable_interrupts();
+    int r = flash_ensure_qe(&mfr);
+    restore_interrupts(irq);
+
+    if (r == 1)
+        printf("Flash (JEDEC %02X): Quad Enable bit was off, now set\n", mfr);
+    else if (r == -2)
+        printf("WARNING: flash (JEDEC %02X) did not accept the Quad Enable bit\n", mfr);
+    else
+        DBG_PRINT("Flash JEDEC %02X: QE %s\n", mfr, r == 0 ? "set" : "not checked");
 }
 
 // Flash timing configuration for overclocking
@@ -880,6 +980,10 @@ static void __no_inline_not_in_flash_func(reconfigure_clocks)(int cpu_mhz, int p
 //=============================================================================
 static void core1_entry(void);
 static bool init_hardware(void) {
+    // Before the overclock and before PSRAM: on flash shipped with QE=0
+    // both fail (see flash_ensure_qe)
+    flash_qe_fixup();
+
     // Configure clocks (including overclock if enabled)
     configure_clocks();
 
@@ -888,10 +992,56 @@ static bool init_hardware(void) {
     uint psram_pin = get_psram_pin();
     DBG_PRINT("  PSRAM CS pin: GPIO%d\n", psram_pin);
     psram_init(psram_pin);
+    uint8_t psram_mfid, psram_kgd;
+    psram_get_id(&psram_mfid, &psram_kgd);
+    DBG_PRINT("  PSRAM ID: MF %02X KGD %02X%s\n", psram_mfid, psram_kgd,
+              psram_kgd == 0x5D ? "" : " (expected 5D: no PSRAM on this CS?)");
 
+    /*
+     * Some boards' PSRAM does not hold the configured clock with the
+     * default sampling delay (#6). Rather than stop dead, step down until
+     * the part answers, and keep that as a cap for every later re-init.
+     */
     size_t detected_psram = psram_detect_size();
+    static const int psram_fallback_mhz[] = { 84, 66, 33 };
+    for (unsigned i = 0; detected_psram < (1u << 20) && i < count_of(psram_fallback_mhz); i++) {
+        if (psram_fallback_mhz[i] >= PSRAM_MAX_FREQ_MHZ) continue;
+        printf("PSRAM not detected (read back %08lX), retrying at %d MHz\n",
+               (unsigned long)psram_probe_readback(), psram_fallback_mhz[i]);
+        psram_init_with_freq(psram_pin, psram_fallback_mhz[i]);
+        detected_psram = psram_detect_size();
+        if (detected_psram >= (1u << 20)) {
+            psram_set_freq_cap(psram_fallback_mhz[i]);
+            printf("WARNING: PSRAM only works at %d MHz or below on this board\n",
+                   psram_fallback_mhz[i]);
+        }
+    }
+#ifdef BOARD_PC
+    /*
+     * The PC layout covers two boards: a Pico 2 in the PICO-PC carrier and
+     * the Olimex RP2350pc (RP2350B). Should the PSRAM not be on the pin
+     * chosen above, try the other candidate before giving up (#10).
+     */
     if (detected_psram < (1u << 20)) {
-        printf("ERROR: QSPI PSRAM not detected or smaller than 1 MiB!\n");
+        uint alt = (psram_pin == 8) ? 47 : 8;
+        printf("PSRAM not found on GPIO%u, trying GPIO%u\n", psram_pin, alt);
+        gpio_set_function(psram_pin, GPIO_FUNC_NULL);
+        psram_set_freq_cap(0);
+        psram_init(alt);
+        psram_get_id(&psram_mfid, &psram_kgd);
+        DBG_PRINT("  PSRAM ID on GPIO%u: MF %02X KGD %02X\n", alt, psram_mfid, psram_kgd);
+        detected_psram = psram_detect_size();
+        if (detected_psram >= (1u << 20)) {
+            psram_pin = alt;
+            psram_cs_override = (int)alt;
+            printf("PSRAM found on GPIO%u\n", alt);
+        }
+    }
+#endif
+    if (detected_psram < (1u << 20)) {
+        printf("ERROR: QSPI PSRAM not detected or smaller than 1 MiB! "
+               "(ID %02X/%02X, read back %08lX)\n",
+               psram_mfid, psram_kgd, (unsigned long)psram_probe_readback());
         // Can't show visual error - VGA not ready yet
         return false;
     }
@@ -901,9 +1051,12 @@ static bool init_hardware(void) {
     // Mount SD before video/audio so persistent output overrides can be read
     // before either backend claims its pins.
     DBG_PRINT("Initializing SD card...\n");
+    DBG_PRINT("  SCK GPIO%d, MOSI GPIO%d, MISO GPIO%d, CS GPIO%d%s\n",
+              SDCARD_PIN_SPI0_SCK, SDCARD_PIN_SPI0_MOSI, SDCARD_PIN_SPI0_MISO,
+              SDCARD_PIN_SPI0_CS, board_is_rp2350pc() ? " (Olimex RP2350pc)" : "");
     FRESULT res = f_mount(&fatfs, "", 1);
     if (res == FR_OK) {
-        FIL fp;
+        static FIL fp;  // static: shallow boot stack, see load_rom()
         if (f_open(&fp, VIDEO_MARKER_VGA, FA_READ) == FR_OK) {
             vga_hw_set_boot_output(true);
             f_close(&fp);
@@ -920,6 +1073,16 @@ static bool init_hardware(void) {
             f_close(&fp);
         }
 #endif
+    }
+
+    // The video driver's 8 KB block off the top of the heap (aligned there by
+    // itself, see hdmi.c), then the heap grown to its new end in one go.
+    // Here, while core 0 is the only one allocating.
+    {
+        extern void *video_ram_block, *heap_reserve_top(size_t size);
+        extern void heap_grow_all(void);
+        video_ram_block = heap_reserve_top(8192);
+        heap_grow_all();
     }
 
     // Initialize video/audio early so SD errors can be shown on screen.
@@ -940,7 +1103,7 @@ static bool init_hardware(void) {
     DBG_PRINT("  SD card mounted\n");
 
     // Check if 386/ directory exists
-    DIR dir;
+    static DIR dir;  // static: shallow boot stack, see load_rom()
     res = f_opendir(&dir, "386");
     if (res != FR_OK) {
         show_error_screen(" Missing Directory ", "Directory '386/' not found on SD card.", "Create it and add config.ini, bios.bin");
@@ -952,10 +1115,11 @@ static bool init_hardware(void) {
     // Load frank-386-specific hardware settings from the per-platform INI
     // This allows cpu_freq and psram_freq to be configured
     {
-        FIL fp;
+        static FIL fp;
         char *content = NULL;
 
-        if (f_open(&fp, CONFIG_FILE_PATH, FA_READ) == FR_OK) {
+        if (f_open(&fp, CONFIG_FILE_PATH, FA_READ) == FR_OK ||
+            f_open(&fp, CONFIG_LEGACY_PATH, FA_READ) == FR_OK) {
             FSIZE_t size = f_size(&fp);
             content = malloc(size + 1);
             if (content) {
@@ -1009,23 +1173,30 @@ static bool init_hardware(void) {
         printf("ERROR: QSPI PSRAM failed detection at configured frequency!\n");
         return false;
     }
+    int psram_mhz_eff = config_get_psram_freq();
+    if (psram_get_freq_cap() > 0 && psram_mhz_eff > psram_get_freq_cap())
+        psram_mhz_eff = psram_get_freq_cap();
     DBG_PRINT("  QSPI PSRAM usable: %lu MiB at %d MHz\n",
-              (unsigned long)(detected_psram >> 20), config_get_psram_freq());
+              (unsigned long)(detected_psram >> 20), psram_mhz_eff);
 
 #ifdef BOARD_HAS_PS2
     // Initialize unified PS/2 driver (keyboard + mouse on shared PIO)
     DBG_PRINT("Initializing PS/2 (unified driver)...\n");
-    DBG_PRINT("  Keyboard CLK: GPIO%d, DATA: GPIO%d\n", PS2_PIN_CLK, PS2_PIN_DATA);
-    DBG_PRINT("  Mouse    CLK: GPIO%d, DATA: GPIO%d\n", PS2_MOUSE_CLK, PS2_MOUSE_DATA);
-    if (!ps2_init(PIO_PS2KBD, PS2_PIN_CLK, PS2_MOUSE_CLK)) {
-        printf("WARNING: PS/2 PIO init failed\n");
+    if (board_is_rp2350pc()) {
+        DBG_PRINT("Olimex RP2350pc: no PS/2 port, skipping PS/2\n");
+    } else {
+        DBG_PRINT("  Keyboard CLK: GPIO%d, DATA: GPIO%d\n", PS2_PIN_CLK, PS2_PIN_DATA);
+        DBG_PRINT("  Mouse    CLK: GPIO%d, DATA: GPIO%d\n", PS2_MOUSE_CLK, PS2_MOUSE_DATA);
+        if (!ps2_init(PIO_PS2KBD, PS2_PIN_CLK, PS2_MOUSE_CLK)) {
+            printf("WARNING: PS/2 PIO init failed\n");
+        }
+
+        // Initialize PS/2 keyboard wrapper (uses unified driver for PIO)
+        ps2kbd_init();
+
+        // Initialize PS/2 mouse device (reset, detect IntelliMouse, enable streaming)
+        ps2_mouse_init_device();
     }
-
-    // Initialize PS/2 keyboard wrapper (uses unified driver for PIO)
-    ps2kbd_init();
-
-    // Initialize PS/2 mouse device (reset, detect IntelliMouse, enable streaming)
-    ps2_mouse_init_device();
 #else
     DBG_PRINT("PS/2 not present on this board; USB HID is the only input\n");
 #endif
@@ -1038,6 +1209,10 @@ static bool init_hardware(void) {
 
     // Initialize NES/SNES gamepad (if pins defined for this board)
 #ifdef NESPAD_GPIO_CLK
+    if (board_is_rp2350pc()) {
+        // GPIO9, the pad's latch on the PICO-PC, is the SD chip select here
+        DBG_PRINT("Olimex RP2350pc: skipping NES gamepad (pins in use)\n");
+    } else {
     DBG_PRINT("Initializing NES gamepad...\n");
     DBG_PRINT("  CLK: GPIO%d, DATA: GPIO%d, LATCH: GPIO%d\n",
               NESPAD_GPIO_CLK, NESPAD_GPIO_DATA, NESPAD_GPIO_LATCH);
@@ -1046,6 +1221,7 @@ static bool init_hardware(void) {
         DBG_PRINT("  NES gamepad initialized\n");
     } else {
         DBG_PRINT("  NES gamepad init failed (PIO unavailable)\n");
+    }
     }
 #endif
 
@@ -1166,8 +1342,8 @@ static bool init_emulator(void) {
     // Check if BIOS file exists before loading
     DBG_PRINT("Loading BIOS...\n");
     if (config.bios && config.bios[0]) {
-        char bios_path[256];
-        FIL fp;
+        static char bios_path[256];  // static: shallow boot stack, see load_rom()
+        static FIL fp;
         snprintf(bios_path, sizeof(bios_path), "386/%s", config.bios);
         if (f_open(&fp, bios_path, FA_READ) != FR_OK) {
             char detail[64];
@@ -1187,10 +1363,70 @@ static bool init_emulator(void) {
     return true;
 }
 
+/* Every software reboot goes through here (frank-ecat's platform_reboot):
+ * core 1 is stopped (it may be reading PSRAM) and the PSRAM taken out of
+ * QPI mode first, or the boot ROM cannot read the flash after a warm reset. */
+void __attribute__((noreturn)) platform_reboot(bool bootsel) {
+    if (get_core_num() == 0) {
+        /* forced off, then released: it restarts into the boot ROM, which
+         * waits for a launch. Left forced off, the bit survives the reboot. */
+        hw_set_bits(&psm_hw->frce_off, PSM_FRCE_OFF_PROC1_BITS);
+        while (!(psm_hw->frce_off & PSM_FRCE_OFF_PROC1_BITS)) tight_loop_contents();
+        busy_wait_us(10);
+        hw_clear_bits(&psm_hw->frce_off, PSM_FRCE_OFF_PROC1_BITS);
+        busy_wait_us(10);
+    }
+    save_and_disable_interrupts();
+    psram_reset_to_spi();
+    if (bootsel) reset_usb_boot(0, 0);
+    watchdog_reboot(0, 0, 0);
+    while (1) tight_loop_contents();
+}
+
+/* Console commands for the bench (bytes from stdio: the UART or USB CDC):
+ * "~BOOT~" reboots into BOOTSEL (then picotool load -x), "~RST~" reboots,
+ * "~STAT~" prints the HDMI output's counters. */
+static void console_poll(void) {
+    static const char *const cmds[] = {"~BOOT~", "~RST~", "~STAT~"};
+    static unsigned pos[3];
+    int ch;
+    while ((ch = getchar_timeout_us(0)) >= 0) {
+        for (int c = 0; c < 3; c++) {
+            const char *m = cmds[c];
+            pos[c] = (ch == m[pos[c]]) ? pos[c] + 1 : (ch == m[0]);
+            if (m[pos[c]]) continue;
+            pos[c] = 0;
+            if (c == 2) {
+                extern bool SELECT_VGA;
+                if (!SELECT_VGA)
+                    printf("\nHDMI: frames %lu, line IRQ max %lu us, starved frames %lu, "
+                           "restarts %lu, audio underruns %lu, drops %lu\n",
+                           (unsigned long)hdmi_frame_count, (unsigned long)hdmi_irq_max_us,
+                           (unsigned long)hdmi_underruns, (unsigned long)hdmi_resyncs,
+                           (unsigned long)hdmi_audio_underruns, (unsigned long)hdmi_audio_drops);
+                hdmi_irq_max_us = 0;
+                continue;
+            }
+            printf("\nrebooting%s\n", c == 0 ? " to BOOTSEL" : "");
+            sleep_ms(20);
+            platform_reboot(c == 0);
+        }
+    }
+}
+
 bool timer_callback(repeating_timer_t *rt);
 void vga_hw_process_deferred(void);
+#define MIXER_TICK_US (1000000 / SOUND_FREQUENCY) /* 22: 45.45 kHz */
 static bool __not_in_flash_func(timer_callback0)(repeating_timer_t *rt) {
-    timer_callback(rt);
+    /* The timer ticks in whole microseconds; skip a tick now and then so
+     * the mixer averages SOUND_FREQUENCY exactly (HDMI audio takes 44.1 kHz,
+     * and the sound devices assume it). */
+    static uint32_t phase;
+    phase += MIXER_TICK_US * SOUND_FREQUENCY;
+    if (phase >= 1000000) {
+        phase -= 1000000;
+        timer_callback(rt);
+    }
     vga_hw_process_deferred();
     return true;
 }
@@ -1210,15 +1446,17 @@ static void __not_in_flash_func(core1_entry)(void) {
     audio_set_volume(config_get_volume());
     audio_set_enabled(true);
     config_clear_changes();
+    extern bool SELECT_VGA;
     while(!initialized) {
         sleep_ms(1);
+        if (!SELECT_VGA) hdmi_watchdog(); /* core 0's boot can stall it */
         __dmb();
     }
     static repeating_timer_t m_timer = { 0 };
-    int hz = 44100;
-	add_repeating_timer_us(-1000000 / hz, timer_callback0, pc, &m_timer);
+	add_repeating_timer_us(-MIXER_TICK_US, timer_callback0, pc, &m_timer);
     while(1) {
         repeat_me_often();
+        if (!SELECT_VGA) hdmi_watchdog();
         sleep_us(1);
     }
     __unreachable();
@@ -1301,6 +1539,17 @@ static void show_welcome_screen(void) {
 //=============================================================================
 
 int main(void) {
+    /*
+     * Core 0's stack grows down from the top of SCRATCH_Y towards the
+     * data placed at its bottom (spread8_lut, the HDMI DMA pointers).
+     * Nothing stops it there by default, and an overflow silently
+     * corrupts those tables (PR #9). Fence the stack off at the end of
+     * that data, so an overflow faults where it happens instead.
+     */
+    extern char __scratch_y_end__[];
+    uintptr_t stack_limit = ((uintptr_t)__scratch_y_end__ + 7u) & ~7u;
+    __asm volatile ("msr msplim, %0" : : "r" (stack_limit));
+
     // Initialize stdio (USB Serial or UART depending on USB HID mode)
     stdio_init_all();
     #ifdef PICO_DEFAULT_LED_PIN
@@ -1329,6 +1578,14 @@ int main(void) {
     } else {
         DBG_PRINT("Timeout - continuing without USB Serial\n\n");
     }
+#elif USB_CDC_CONSOLE
+    // USB HID on PIO-USB: the native port is the CDC console (and the UART)
+    usb_console_init();
+    absolute_time_t deadline = make_timeout_time_ms(USB_CONSOLE_DELAY_MS);
+    while (!usb_console_connected() && !time_reached(deadline)) {
+        sleep_ms(100);
+    }
+    DBG_PRINT("USB HID on PIO-USB, console on native USB and UART\n\n");
 #else
     // USB HID mode: using UART for debug output
     DBG_PRINT("USB HID mode: USB port used for keyboard input\n");
@@ -1341,6 +1598,10 @@ int main(void) {
     DBG_PRINT("  Board: M1\n");
 #elif defined(BOARD_M2)
     DBG_PRINT("  Board: M2\n");
+#elif defined(BOARD_PC)
+    DBG_PRINT("  Board: PC (Olimex PICO-PC)\n");
+#elif defined(BOARD_Z2)
+    DBG_PRINT("  Board: Z2 (Waveshare RP2350-PiZero)\n");
 #elif defined(BOARD_C2)
     DBG_PRINT("  Board: C2 (FRANK Core 2 master)\n");
 #else
@@ -1415,6 +1676,7 @@ int main(void) {
         if (pc->paused) {
             // Still poll keyboard to handle UI input
             poll_keyboard();
+            console_poll();
 
             // Animate plasma background for active UI
             if (diskui_is_open()) {
@@ -1441,6 +1703,7 @@ int main(void) {
         if (++poll_counter >= 20) {
             poll_counter = 0;
             poll_keyboard();
+            console_poll();
         }
 
         // Check for reset request
@@ -1456,7 +1719,7 @@ int main(void) {
             DBG_PRINT("Settings changed - triggering RP reset...\n");
             // Full hardware reset via watchdog
             *(uint32_t*)(0x20000000 + (512ul << 10) - 32) = 0x1927fa52; // magic to fast reboot
-            watchdog_reboot(0, 0, 0);
+            platform_reboot(false);
         }
 
         // Check for shutdown
@@ -1484,8 +1747,7 @@ int main(void) {
 
     DBG_PRINT("\nEmulation stopped.\n");
     *(uint32_t*)(0x20000000 + (512ul << 10) - 32) = 0x1927fa52; // magic to fast reboot
-    watchdog_reboot(0, 0, 0);
-    while (true);
+    platform_reboot(false);
     __unreachable();
     return 0;
 }

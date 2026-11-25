@@ -70,8 +70,64 @@ export PICO_SDK_PATH=/path/to/pico-sdk
 ./build.sh
 ```
 
-See `build.sh` for board and USB options.
+See `build.sh` for board and USB options. The default board is M2. This tree
+includes upstream firmware v1.08.
+
+### HDMI
+
+HDMI output is real HDMI (not DVI): data islands, AVI and audio InfoFrames, and
+44.1 kHz stereo. It works with USB HDMI capture cards as well as monitors and
+TVs. AdLib, Sound Blaster, the PC speaker, and the other sound devices play
+over I2S or PWM, and also over HDMI when HDMI is the output.
+
+### PSRAM
+
+The firmware expects 8MB QSPI PSRAM on the RP2350's second QSPI chip select
+(XIP CS1: GPIO47 on RP2350B, GPIO19 or GPIO8 on RP2350A), sharing the bus with
+the flash. PSRAM wired as a plain SPI device on other GPIOs is not supported.
+If the part does not answer at the configured clock, bring-up retries slower
+clocks. On the PC layout it also tries the other candidate chip select (GPIO8
+or GPIO47) before giving up, which covers both the PICO-PC carrier and the
+Olimex RP2350pc.
+
+### Z2 USB
+
+USB HID builds for Z2 run the USB host on the board's PIO-USB USB-C socket
+(GPIO28/29, via [Pico-PIO-USB](https://github.com/sekigon-gonnoc/Pico-PIO-USB)).
+Plug the keyboard, mouse, or a hub there. The native USB socket is then a USB
+serial console (CDC), alongside a UART console on GPIO0 (TX) / GPIO1 (RX) at
+115200 baud. That UART uses the Z2 PS/2 mouse pins, so PS/2 is dropped in a
+USB HID build. Build with `-DZ2_PIO_USB=OFF` to use the native socket for the
+host instead (no USB console then).
+
+### Flash Quad Enable
+
+Some non-Winbond flash parts (for example Puya on some Waveshare
+RP2350-PiZero batches) ship with the Quad Enable bit cleared, which makes
+PSRAM boards fail once overclocked. The firmware checks the bit on every boot
+and sets it once if needed.
+
+### Console commands
+
+On the serial console (USB CDC or UART, 115200 baud):
+
+| Command | Action |
+|---------|--------|
+| `~BOOT~` | Reboot into BOOTSEL, ready for `picotool load -x` |
+| `~RST~` | Reboot |
+| `~STAT~` | HDMI counters: frames, longest line IRQ, output restarts, HDMI audio underruns/drops |
+
+Every software reboot stops core 1 and takes the PSRAM out of QPI mode first,
+so the boot ROM can read the flash after a warm reset.
+
+If the platform config file is missing, the firmware also reads the legacy
+`386/config.ini` path.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE). Upstream v1.06–v1.08 vendors
+[Pico-PIO-USB](https://github.com/sekigon-gonnoc/Pico-PIO-USB) 0.7.2 (MIT,
+`drivers/pio_usb`) and the HDMI packet encoder in `drivers/hdmi/hstx_packet.c`
+(public domain; see `drivers/hdmi/LICENSE.pico_hdmi`). The RP2350 platform
+code by DnCraptor included here is MIT; no GPL Quake or QuakeGeneric code is
+used.
